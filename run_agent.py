@@ -29,6 +29,7 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+import queue
 import random
 import re
 import sys
@@ -107,7 +108,6 @@ from agent.trajectory import (
     save_trajectory as _save_trajectory_to_file,
 )
 from utils import atomic_json_write, env_var_enabled
-
 
 
 class _SafeWriter:
@@ -739,6 +739,8 @@ class AIAgent:
         self.thinking_callback = thinking_callback
         self.reasoning_callback = reasoning_callback
         self.clarify_callback = clarify_callback
+        self._pending_clarifications: Dict[str, Dict[str, Any]] = {}
+        self._pending_clarifications_lock = threading.Lock()
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
         self.interim_assistant_callback = interim_assistant_callback
@@ -2986,6 +2988,82 @@ class AIAgent:
             "budget_used": self.iteration_budget.used,
             "budget_max": self.iteration_budget.max_total,
         }
+
+    def _track_pending_clarification(
+        self,
+        correlation_id: str,
+        response_queue: "queue.Queue[str]",
+        question: str,
+        choices: Optional[List[str]],
+    ) -> None:
+        with self._pending_clarifications_lock:
+            self._pending_clarifications[correlation_id] = {
+                "response_queue": response_queue,
+                "question": question,
+                "choices": list(choices or []),
+                "created_at": time.time(),
+            }
+
+    def _clear_pending_clarification(self, correlation_id: str) -> None:
+        with self._pending_clarifications_lock:
+            self._pending_clarifications.pop(correlation_id, None)
+
+    def _clarify_with_companion_bridge(
+        self,
+        question: str,
+        choices: Optional[List[str]],
+    ) -> str:
+        """Use the localhost companion when reachable, otherwise fall back locally."""
+        from gateway import companion_bridge
+
+        response_queue: "queue.Queue[str]" = queue.Queue(maxsize=1)
+        correlation_id = uuid.uuid4().hex
+
+        self._track_pending_clarification(correlation_id, response_queue, question, choices)
+        companion_bridge.register_pending_clarification(correlation_id, response_queue)
+        remote_sent = False
+        try:
+            remote_sent = companion_bridge.send_clarification_event(
+                question,
+                choices,
+                correlation_id,
+                source=self.platform or "chat",
+            )
+        except Exception as exc:
+            logger.debug("Failed sending companion clarification event: %s", exc)
+            remote_sent = False
+
+        if not remote_sent:
+            self._clear_pending_clarification(correlation_id)
+            companion_bridge.unregister_pending_clarification(correlation_id)
+            return self.clarify_callback(question, choices)
+
+        try:
+            result = response_queue.get()
+        finally:
+            self._clear_pending_clarification(correlation_id)
+            companion_bridge.unregister_pending_clarification(correlation_id)
+
+        return result
+
+    def _run_clarify_tool(self, question: str, choices: Optional[List[str]]) -> str:
+        from tools.clarify_tool import clarify_tool as _clarify_tool
+
+        callback = self.clarify_callback
+        if callback is not None:
+            try:
+                from gateway import companion_bridge
+
+                if companion_bridge.is_enabled():
+                    callback = self._clarify_with_companion_bridge
+            except Exception as exc:
+                logger.debug("Companion bridge unavailable for clarify: %s", exc)
+
+        return _clarify_tool(
+            question=question,
+            choices=choices,
+            callback=callback,
+        )
 
     def shutdown_memory_provider(self, messages: list = None) -> None:
         """Shut down the memory provider and context engine — call at actual session boundaries.
@@ -6950,11 +7028,9 @@ class AIAgent:
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
         elif function_name == "clarify":
-            from tools.clarify_tool import clarify_tool as _clarify_tool
-            return _clarify_tool(
+            return self._run_clarify_tool(
                 question=function_args.get("question", ""),
                 choices=function_args.get("choices"),
-                callback=self.clarify_callback,
             )
         elif function_name == "delegate_task":
             from tools.delegate_tool import delegate_task as _delegate_task
@@ -7337,11 +7413,9 @@ class AIAgent:
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
             elif function_name == "clarify":
-                from tools.clarify_tool import clarify_tool as _clarify_tool
-                function_result = _clarify_tool(
+                function_result = self._run_clarify_tool(
                     question=function_args.get("question", ""),
                     choices=function_args.get("choices"),
-                    callback=self.clarify_callback,
                 )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
